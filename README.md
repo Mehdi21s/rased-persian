@@ -1,14 +1,17 @@
-# Telegram News Translator V4 — source channels configured
+# Telegram News Translator — Panel V4
 
-Default source channels:
-- @rasedal3ado138e
-- @SolIalIe
+Railway worker with Telethon source listener and an aiogram admin panel.
 
-Target: @rasedpersian
+Required Railway variables:
+- API_ID, API_HASH, SESSION_STRING, BOT_TOKEN
+- SOURCE_CHANNELS — comma-separated, e.g. `rasedal3ado138e,kataebAlqasam`
+- TARGET_CHANNEL — e.g. `@rasedpersian`
+- LIBRETRANSLATE_URL and optionally LIBRETRANSLATE_API_KEY
+- ADMIN_IDS — numeric Telegram user ID(s), comma-separated (recommended)
+- TAG_TEXT — optional initial tag
 
-Railway Variables (set explicitly; SOURCE_CHANNELS overrides the default):
-- SOURCE_CHANNELS=rasedal3ado138e,SolIalIe
-- TARGET_CHANNEL=@rasedpersian
-- Start command: python main.py
+Open a private chat with the bot and send `/panel`. Choose “تنظیم تگ”, then send the tag as one message. Premium custom emoji entities in that message are saved in `bot_config.json`.
 
-The Telethon account identified by SESSION_STRING must be able to access both source channels. The Bot API bot must be an admin in the target channel with permission to post and manage reactions. Set ADMIN_IDS to your numeric Telegram user ID to restrict the panel; /panel opens the panel.
+Add the Telethon account (SESSION_STRING) to both source channels. Add the bot as an administrator in the target channel with permission to post and manage reactions. Set SOURCE_CHANNELS to both desired usernames separated by a comma. Railway variables override code defaults.
+
+Railway ephemeral storage may reset bot_config.json on redeploy; use a Railway Volume and set DATA_DIR to its mount path for persistence.

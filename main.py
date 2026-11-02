@@ -8,10 +8,11 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument, MessageEntity, ReactionTypeEmoji
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl import types as tl_types
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("news-translator")
-log.info("RASED_TRANSLATOR_PANEL_V4 starting")
+log.info("RASED_TRANSLATOR_PREMIUM_EMOJI_V5 starting")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -21,7 +22,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # SOURCE_CHANNELS takes priority if both are set.
 _sources_raw = os.getenv("SOURCE_CHANNELS", "").strip()
 if not _sources_raw:
-    _sources_raw = os.getenv("SOURCE_CHANNEL", "rasedal3ado138e,SolIalIe").strip()
+    _sources_raw = os.getenv("SOURCE_CHANNEL", "rasedal3ado138e,kataebAlqasam").strip()
 SOURCE_CHANNELS = list(dict.fromkeys(
     x.strip().strip().lstrip("@").strip()
     for x in re.split(r"[,;\n]+", _sources_raw)
@@ -124,20 +125,24 @@ async def capture_panel_tag(message):
         return
     if not is_admin(message.from_user.id):
         return
-    value = (message.text or message.caption or "").strip()
+    raw_value = message.text or message.caption or ""
+    value = raw_value.strip()
     if not value:
         await message.answer("تگ خالی است؛ دوباره ارسال کن.")
         return
+    leading = len(raw_value) - len(raw_value.lstrip())
+    leading_utf16 = _utf16_len(raw_value[:leading])
+    value = raw_value.strip()
     TAG_TEXT = value
     TAG_ENTITIES = []
     for entity in (message.entities or message.caption_entities or []):
         if entity.type == "custom_emoji" and entity.custom_emoji_id:
-            TAG_ENTITIES.append({
-                "type": "custom_emoji",
-                "offset": entity.offset,
-                "length": entity.length,
-                "custom_emoji_id": entity.custom_emoji_id,
-            })
+            adjusted_offset = entity.offset - leading_utf16
+            if adjusted_offset >= 0 and adjusted_offset + entity.length <= _utf16_len(value):
+                TAG_ENTITIES.append({
+                    "type": "custom_emoji", "offset": adjusted_offset,
+                    "length": entity.length, "custom_emoji_id": entity.custom_emoji_id,
+                })
     save_runtime_config()
     pending_tag_users.discard(message.from_user.id)
     await message.answer("تگ ذخیره شد. ایموجی‌های سفارشی‌ای که همراه پیام ارسال شده باشند نیز ثبت شدند.")
@@ -198,24 +203,19 @@ def _utf16_len(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 def quote_entities(text: str):
-    """Return quote + configured premium custom emoji entities for the appended tag."""
+    """Create Telegram entities for the Premium user session (not Bot API)."""
     if not TAG_TEXT or not text:
         return None
     start = text.rfind(TAG_TEXT)
     if start < 0:
         return None
     offset = _utf16_len(text[:start])
-    entities = [MessageEntity(type="blockquote", offset=offset, length=_utf16_len(TAG_TEXT))]
+    entities = [tl_types.MessageEntityBlockquote(offset=offset, length=_utf16_len(TAG_TEXT))]
     for item in TAG_ENTITIES:
-        try:
-            entities.append(MessageEntity(
-                type="custom_emoji",
-                offset=offset + int(item["offset"]),
-                length=int(item["length"]),
-                custom_emoji_id=str(item["custom_emoji_id"]),
-            ))
-        except Exception:
-            log.exception("Invalid saved custom emoji entity in tag")
+        entities.append(tl_types.MessageEntityCustomEmoji(
+            offset=offset + int(item["offset"]), length=int(item["length"]),
+            document_id=int(item["custom_emoji_id"]),
+        ))
     return entities
 
 
@@ -232,17 +232,14 @@ async def react_heart(message_id: int):
 
 
 async def publish_text(text: str):
-    """Publish text chunks, quote-format the tag, and heart-react to each sent message."""
+    """Publish text using the connected Premium Telegram account."""
     full_text = add_tag(text)
     sent_messages = []
     for chunk in split_text(full_text):
-        entities = quote_entities(chunk)
-        sent = await bot.send_message(
-            TARGET_CHANNEL, chunk,
-            entities=entities,
-            parse_mode=None,
+        sent = await client.send_message(
+            TARGET_CHANNEL, chunk, formatting_entities=quote_entities(chunk), link_preview=False
         )
-        await react_heart(sent.message_id)
+        await react_heart(sent.id)
         sent_messages.append(sent)
     return sent_messages
 
@@ -332,16 +329,12 @@ async def send_translated_message(message, source_key: str):
                 media_path = tmp.name
             downloaded = await message.download_media(file=media_path)
             if downloaded:
-                upload_file = FSInputFile(downloaded)
-                if mime.startswith("image/"):
-                    sent = await bot.send_photo(TARGET_CHANNEL, photo=upload_file, caption=caption, caption_entities=caption_entities)
-                elif mime.startswith("video/"):
-                    sent = await bot.send_video(TARGET_CHANNEL, video=upload_file, caption=caption, caption_entities=caption_entities, supports_streaming=True)
-                elif mime.startswith("audio/"):
-                    sent = await bot.send_audio(TARGET_CHANNEL, audio=upload_file, caption=caption, caption_entities=caption_entities)
-                else:
-                    sent = await bot.send_document(TARGET_CHANNEL, document=upload_file, caption=caption, caption_entities=caption_entities)
-                sent_messages.append(sent)
+                sent = await client.send_file(
+                    TARGET_CHANNEL, downloaded, caption=caption or "",
+                    formatting_entities=quote_entities(caption or ""),
+                    supports_streaming=mime.startswith("video/"),
+                )
+                sent_messages.extend(sent if isinstance(sent, list) else [sent])
             else:
                 log.error("Could not download media for source message %s", message.id)
                 return
@@ -350,11 +343,11 @@ async def send_translated_message(message, source_key: str):
             await publish_text(translated) if translated else await publish_text("")
 
         for sent in sent_messages:
-            await react_heart(sent.message_id)
+            await react_heart(sent.id)
         if remainder:
             for chunk in split_text(remainder):
-                sent = await bot.send_message(TARGET_CHANNEL, chunk, parse_mode=None)
-                await react_heart(sent.message_id)
+                sent = await client.send_message(TARGET_CHANNEL, chunk, link_preview=False)
+                await react_heart(sent.id)
         seen_ids.add(post_key)
         save_seen()
         log.info("Relayed message %s", message.id)
@@ -419,28 +412,23 @@ async def send_translated_album(messages, source_key: str):
                 media_items.append(InputMediaDocument(media=upload, caption=item_caption, caption_entities=item_entities))
 
         sent_messages = []
-        if len(media_items) >= 2:
-            sent_messages = await bot.send_media_group(TARGET_CHANNEL, media=media_items)
-        elif len(media_items) == 1:
-            only = media_items[0]
-            if isinstance(only, InputMediaVideo):
-                sent_messages = [await bot.send_video(TARGET_CHANNEL, video=only.media, caption=only.caption, caption_entities=only.caption_entities, supports_streaming=True)]
-            elif isinstance(only, InputMediaPhoto):
-                sent_messages = [await bot.send_photo(TARGET_CHANNEL, photo=only.media, caption=only.caption, caption_entities=only.caption_entities)]
-            else:
-                sent_messages = [await bot.send_document(TARGET_CHANNEL, document=only.media, caption=only.caption, caption_entities=only.caption_entities)]
+        if paths:
+            sent = await client.send_file(
+                TARGET_CHANNEL, paths, caption=caption or "",
+                formatting_entities=entities, supports_streaming=True,
+            )
+            sent_messages = sent if isinstance(sent, list) else [sent]
         else:
-            sent_messages = []
             await publish_text(translated)
 
-        # Add a heart reaction to every message returned for the album.
+        # Heart reaction is added to every message in the album.
         for sent in sent_messages:
-            await react_heart(sent.message_id)
+            await react_heart(sent.id)
         remainder = full_caption[1024:].strip() if len(full_caption) > 1024 else ""
         if remainder:
             for chunk in split_text(remainder):
-                sent = await bot.send_message(TARGET_CHANNEL, chunk, parse_mode=None)
-                await react_heart(sent.message_id)
+                sent = await client.send_message(TARGET_CHANNEL, chunk, link_preview=False)
+                await react_heart(sent.id)
 
         seen_ids.add(album_key)
         for item in messages:
