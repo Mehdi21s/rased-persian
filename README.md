@@ -1,20 +1,9 @@
-# ربات تلگرام با دو منبع و پشتیبانی از Custom Emoji
+# Telegram News Translator (Quote + Heart)
 
-## Railway Variables
-- `API_ID`
-- `API_HASH`
-- `SESSION_STRING`
-- `BOT_TOKEN`
-- `ADMIN_ID`
-- `SOURCE_CHANNEL=@rasedal3ado138e`
-- `SOURCE_CHANNEL_2=@SolIalIe`
-- `TARGET_CHANNEL=@rasedpersian`
+Railway deployment files. Keep your existing Railway Variables: API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, SOURCE_CHANNELS, TARGET_CHANNEL, TAG_TEXT, LIBRETRANSLATE_URL, LIBRETRANSLATE_API_KEY, TRANSLATE_REQUIRED, DATA_DIR.
 
-یا به‌جای دو متغیر منبع:
-`SOURCE_CHANNELS=@rasedal3ado138e,@SolIalIe`
+The bot appends TAG_TEXT with a real blank line, formats the tag as a Telegram blockquote, preserves source emoji in text, and attempts to add a ❤️ reaction to each published message.
 
-## تنظیم تگ با ایموجی سفارشی
-در چت با ربات پنل، دستور `/settag` را به‌همراه متن و ایموجی Premium در همان پیام بفرست. کد، اطلاعات Custom Emoji را از entityهای تلگرام ذخیره می‌کند. اگر ایموجی را از جایی کپی کنی که تلگرام آن را به ایموجی معمولی تبدیل کرده باشد، اطلاعات سفارشی در دسترس نیست.
+Important: add BOT_TOKEN bot as an administrator in TARGET_CHANNEL and allow it to manage reactions. Telegram may reject reactions if this permission is missing or channel reactions are disabled.
 
-## نکته درباره ایموجی‌های پست منبع
-کد تلاش می‌کند Custom Emojiهای پست منبع را وقتی کاراکتر جایگزین‌شان در متن ترجمه باقی مانده باشد، حفظ کند. چون متن ترجمه‌شده ممکن است آن کاراکتر را تغییر دهد یا حذف کند، حفظ همه ایموجی‌های متن منبع تضمین‌شده نیست. در این نسخه، فرمت‌بندی‌های دیگر متن نیز به‌طور کامل منتقل نمی‌شوند.
+Set Railway Start Command to `python main.py` (or use the included Procfile). Do not use `main.pyn`.

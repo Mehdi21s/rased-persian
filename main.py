@@ -1,400 +1,388 @@
-import asyncio
-import json
-import logging
-import os
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import asyncio, json, logging, os, re, tempfile, urllib.request, urllib.error
 from pathlib import Path
+from typing import Optional
 
-from telethon import TelegramClient, events, Button
+from aiogram import Bot
+from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument, MessageEntity, ReactionTypeEmoji
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl import functions
-from telethon.tl.types import MessageEntityCustomEmoji
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("arabic-to-persian")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("news-translator")
+log.info("RASED_TRANSLATOR_QUOTE_HEART_V3 starting")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-# Configure one or more sources. Preferred: SOURCE_CHANNELS="@source1,@source2".
-# Backward compatible: SOURCE_CHANNEL plus optional SOURCE_CHANNEL_2.
-def _read_source_channels():
-    combined = os.getenv("SOURCE_CHANNELS", "").strip()
-    if combined:
-        values = [item.strip() for item in combined.split(",") if item.strip()]
-    else:
-        values = [
-            os.getenv("SOURCE_CHANNEL", "@rasedal3ado138e").strip(),
-            os.getenv("SOURCE_CHANNEL_2", "@SolIalIe").strip(),
-        ]
-        values = [item for item in values if item]
-    # Preserve order while removing duplicates.
-    return list(dict.fromkeys(values))
-
-SOURCE_CHANNELS = _read_source_channels()
+# Accept either SOURCE_CHANNELS (comma-separated) or the older SOURCE_CHANNEL variable.
+# SOURCE_CHANNELS takes priority if both are set.
+_sources_raw = os.getenv("SOURCE_CHANNELS", "").strip()
+if not _sources_raw:
+    _sources_raw = os.getenv("SOURCE_CHANNEL", "HoopoeAr,kataebAlqasam").strip()
+SOURCE_CHANNELS = list(dict.fromkeys(
+    x.strip().strip().lstrip("@").strip()
+    for x in re.split(r"[,;\n]+", _sources_raw)
+    if x.strip().strip().lstrip("@")
+))
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian")
-SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
+TAG_TEXT = os.getenv("TAG_TEXT", "✨ @rasedpersian").strip()
+CATCHUP_LIMIT = max(0, int(os.getenv("CATCHUP_LIMIT", "0")))
+TRANSLATE_REQUIRED = os.getenv("TRANSLATE_REQUIRED", "true").lower() not in {"0", "false", "no", "off"}
+DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/news-translator"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SEEN_FILE = DATA_DIR / "seen_posts.json"
 
+proxy = None
+if os.getenv("PROXY_HOST") and os.getenv("PROXY_PORT"):
+    proxy = ("socks5", os.getenv("PROXY_HOST"), int(os.getenv("PROXY_PORT")))
 
-def load_settings():
+bot = Bot(token=BOT_TOKEN)
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, proxy=proxy)
+LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate.railway.internal:5000/translate")
+LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
+seen_ids = set()
+
+def load_seen():
+    global seen_ids
     try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {
-                "tag": str(data.get("tag", "@rasedpersian")),
-                "tag_entities": data.get("tag_entities", []),
-            }
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {"tag": os.getenv("POST_TAG", "@rasedpersian"), "tag_entities": []}
+        if SEEN_FILE.exists():
+            seen_ids = {str(x) for x in json.loads(SEEN_FILE.read_text(encoding="utf-8"))}
+    except Exception:
+        log.exception("Could not load seen post IDs")
+
+def save_seen():
+    try:
+        SEEN_FILE.write_text(json.dumps(sorted(seen_ids)), encoding="utf-8")
+    except Exception:
+        log.exception("Could not save seen post IDs")
+
+def remove_emojis(text: str) -> str:
+    # Remove common emoji, pictographs, flags, and variation selectors.
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F1E6-\U0001F1FF"
+        "\U0001F300-\U0001FAFF"
+        "\U00002600-\U000027BF"
+        "\U0000FE0F"
+        "\U0000200D"
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub("", text)
 
 
-settings = load_settings()
-settings_lock = threading.Lock()
-
-
-def save_settings():
-    with settings_lock:
-        SETTINGS_FILE.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-
-def get_tag():
-    with settings_lock:
-        return settings.get("tag", "").strip()
-
-
-def get_tag_entities(prefix=""):
-    """Return saved custom-emoji entities shifted after the supplied prefix."""
-    shift = len((prefix or "").encode("utf-16-le")) // 2
-    with settings_lock:
-        saved = list(settings.get("tag_entities", []))
-    result = []
-    for item in saved:
-        try:
-            result.append(MessageEntityCustomEmoji(
-                offset=int(item["offset"]) + shift,
-                length=int(item["length"]),
-                document_id=int(item["document_id"]),
-            ))
-        except (KeyError, TypeError, ValueError):
-            log.warning("Ignoring invalid saved custom emoji entity")
-    return result
-
-
-def utf16_to_index(text, offset):
-    """Convert Telegram's UTF-16 offset to a Python string index."""
-    units = 0
-    for i, char in enumerate(text):
-        if units >= offset:
-            return i
-        units += len(char.encode("utf-16-le")) // 2
-    return len(text)
-
-
-def custom_emoji_entities_from_message(message, target_text):
-    """Keep source custom emojis only when their placeholder character survives translation."""
-    original = message.message or ""
-    target_entities = []
-    for entity in (getattr(message, "entities", None) or []):
-        if not isinstance(entity, MessageEntityCustomEmoji):
+def clean_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    lines = []
+    for line in text.splitlines():
+        if re.search(r"(?:منبع|source)\s*[:：]", line, re.I):
             continue
-        start = utf16_to_index(original, entity.offset)
-        end = utf16_to_index(original, entity.offset + entity.length)
-        placeholder = original[start:end]
-        if not placeholder:
+        if re.search(r"https?://t\.me/(?:HoopoeAr|rasedpersian)\b", line, re.I):
             continue
-        pos = target_text.find(placeholder)
-        if pos < 0:
-            continue
-        target_offset = len(target_text[:pos].encode("utf-16-le")) // 2
-        target_entities.append(MessageEntityCustomEmoji(
-            offset=target_offset,
-            length=entity.length,
-            document_id=entity.document_id,
-        ))
-    return target_entities
+        lines.append(line)
+    return "\n".join(lines).strip()
 
-
-def with_tag(text, tag):
+def add_tag(text: str) -> str:
+    """Append the configured channel tag once; premium custom emoji IDs need separate entities."""
     text = (text or "").strip()
-    tag = (tag or "").strip()
+    tag = TAG_TEXT
     if not tag:
         return text
-    return f"{text}\\n\\n{tag}" if text else tag
-
-
-async def send_tagged_text(target_peer, text, source_message=None):
-    """Send text with custom emoji entities for source text (when mappable) and saved tag."""
-    text = (text or "").strip()
-    tag = get_tag()
-    body = f"{text}\\n\\n{tag}" if text and tag else (text or tag)
-    entities = []
-    if source_message and text:
-        entities.extend(custom_emoji_entities_from_message(source_message, text))
-    if tag:
-        prefix = f"{text}\\n\\n" if text else ""
-        entities.extend(get_tag_entities(prefix))
-    await user_client.send_message(
-        target_peer, body, formatting_entities=entities or None, link_preview=False
-    )
-
-
-def is_admin(event):
-    return bool(event.sender_id == ADMIN_ID)
-
-
-user_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-panel_client = TelegramClient("panel_bot_session", API_ID, API_HASH)
-
-
-async def translate_message(message, peer):
-    """Use Telegram's own MTProto translation method, not an external translator."""
-    source_text = message.message or ""
-    if not source_text.strip():
-        return ""
-    result = await user_client(
-        functions.messages.TranslateTextRequest(
-            peer=peer,
-            id=[message.id],
-            to_lang="fa",
-        )
-    )
-    items = getattr(result, "result", None) or []
-    if not items:
-        raise RuntimeError("Telegram returned no translated text")
-    return (items[0].text or "").strip()
-
-
-def with_tag(text, tag):
-    text = (text or "").strip()
-    tag = (tag or "").strip()
-    if not tag:
+    if tag in text:
         return text
     return f"{text}\n\n{tag}" if text else tag
 
 
-async def translate_and_publish(messages, source_peer, target_peer):
-    # Prevent double publishing: ordinary NewMessage handler ignores grouped media;
-    # albums are handled here as a single unit.
-    messages = sorted(messages, key=lambda m: m.id)
-    media_messages = [m for m in messages if m.media]
-    if not media_messages:
-        for message in messages:
-            if not (message.message or "").strip():
-                continue
-            translated = await translate_message(message, source_peer)
-            if not translated:
-                log.warning("Empty translation for source message %s; skipped", message.id)
-                continue
-            await send_tagged_text(target_peer, translated, source_message=message)
-            log.info("Published text message %s", message.id)
-        return
-
-    # Usually only the first item of a Telegram album carries a caption.
-    captions = []
-    for message in messages:
-        text = (message.message or "").strip()
-        if text:
-            captions.append((message, await translate_message(message, source_peer)))
-    translated_caption = captions[0][1] if captions else ""
-    tag = get_tag()
-
-    # Telegram media captions are limited; keep media safe by moving long translated
-    # captions to a separate text post instead of failing the entire album send.
-    if translated_caption and len(with_tag(translated_caption, tag)) <= 900:
-        caption = with_tag(translated_caption, tag)
-        caption_entities = []
-        if captions:
-            caption_entities.extend(custom_emoji_entities_from_message(captions[0][0], translated_caption))
-        if tag:
-            prefix = f"{translated_caption}\\n\\n" if translated_caption else ""
-            caption_entities.extend(get_tag_entities(prefix))
-        await user_client.send_file(
-            target_peer,
-            [m for m in media_messages],
-            caption=caption,
-            formatting_entities=caption_entities or None,
-        )
-    else:
-        await user_client.send_file(target_peer, [m for m in media_messages])
-        if translated_caption:
-            caption_source = captions[0][0] if captions else None
-            await send_tagged_text(target_peer, translated_caption, source_message=caption_source)
-        elif tag:
-            await send_tagged_text(target_peer, "")
-    log.info("Published media group/message %s", ",".join(str(m.id) for m in messages))
+def quote_entities(text: str):
+    """Return a Telegram blockquote entity for the appended tag, if present."""
+    if not TAG_TEXT or not text:
+        return None
+    start = text.rfind(TAG_TEXT)
+    if start < 0:
+        return None
+    return [MessageEntity(type="blockquote", offset=start, length=len(TAG_TEXT))]
 
 
-async def on_new_message(event):
-    if getattr(event.message, "grouped_id", None):
-        return
+async def react_heart(message_id: int):
+    """Add a heart reaction to a published channel message (bot must be channel admin)."""
     try:
-        source_peer = await user_client.get_input_entity(event.chat_id)
-        target_peer = await user_client.get_input_entity(TARGET_CHANNEL)
-        log.info("Received source message: channel=%s message_id=%s", event.chat_id, event.message.id)
-        await translate_and_publish([event.message], source_peer, target_peer)
+        await bot.set_message_reaction(
+            chat_id=TARGET_CHANNEL,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji="❤️")],
+        )
     except Exception:
-        log.exception(
-            "Failed processing source message: channel=%s message_id=%s",
-            getattr(event, "chat_id", "unknown"), event.message.id
+        log.exception("Could not add heart reaction to target message %s; check bot admin/reaction permissions", message_id)
+
+
+async def publish_text(text: str):
+    """Publish text chunks, quote-format the tag, and heart-react to each sent message."""
+    full_text = add_tag(text)
+    sent_messages = []
+    for chunk in split_text(full_text):
+        entities = quote_entities(chunk)
+        sent = await bot.send_message(
+            TARGET_CHANNEL, chunk,
+            entities=entities,
+            parse_mode=None,
         )
+        await react_heart(sent.message_id)
+        sent_messages.append(sent)
+    return sent_messages
 
 
-async def on_album(event):
+def split_text(text: str, limit: int = 4000):
+    text = text.strip()
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        yield text[:cut].strip()
+        text = text[cut:].strip()
+    if text:
+        yield text
+
+def _libretranslate_request(text: str) -> str:
+    payload = {
+        "q": text,
+        "source": "auto",
+        "target": "fa",
+        "format": "text",
+    }
+    if LIBRETRANSLATE_API_KEY:
+        payload["api_key"] = LIBRETRANSLATE_API_KEY
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        LIBRETRANSLATE_URL,
+        data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return body.get("translatedText", "")
+
+
+async def translate_text(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return ""
+    last_error = None
+    for attempt in range(5):
+        try:
+            result = await asyncio.to_thread(_libretranslate_request, text)
+            result = clean_text(result or "")
+            if not result and TRANSLATE_REQUIRED:
+                raise RuntimeError("LibreTranslate returned an empty result")
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                wait_seconds = min(2 ** attempt, 16)
+                log.warning("LibreTranslate attempt %s/5 failed; retrying in %s seconds: %s",
+                            attempt + 1, wait_seconds, exc)
+                await asyncio.sleep(wait_seconds)
+    raise RuntimeError(f"LibreTranslate failed after 5 attempts: {last_error}") from last_error
+
+async def send_translated_message(message, source_key: str):
+    post_key = f"{source_key}:{message.id}"
+    if post_key in seen_ids or str(message.id) in seen_ids:
+        return
+    original = clean_text(message.message or "")
+    translated = ""
+    if original:
+        try:
+            translated = await translate_text(original)
+        except Exception:
+            log.exception("Translation failed for message %s", message.id)
+            if TRANSLATE_REQUIRED:
+                return
+            translated = original
+
+    full_caption = add_tag(translated)
+    caption = full_caption[:1024] if full_caption else None
+    caption_entities = quote_entities(caption or "")
+    remainder = full_caption[1024:].strip() if len(full_caption) > 1024 else ""
+    media_path = None
     try:
-        source_peer = await user_client.get_input_entity(event.chat_id)
-        target_peer = await user_client.get_input_entity(TARGET_CHANNEL)
-        message_ids = ",".join(str(m.id) for m in event.messages)
-        log.info("Received source album: channel=%s message_ids=%s", event.chat_id, message_ids)
-        await translate_and_publish(list(event.messages), source_peer, target_peer)
+        sent_messages = []
+        if message.media:
+            mime = (getattr(message.file, "mime_type", "") or "").lower() if message.file else ""
+            suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+                      "video/mp4": ".mp4", "audio/mpeg": ".mp3", "audio/ogg": ".ogg"}.get(mime, "")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                media_path = tmp.name
+            downloaded = await message.download_media(file=media_path)
+            if downloaded:
+                upload_file = FSInputFile(downloaded)
+                if mime.startswith("image/"):
+                    sent = await bot.send_photo(TARGET_CHANNEL, photo=upload_file, caption=caption, caption_entities=caption_entities)
+                elif mime.startswith("video/"):
+                    sent = await bot.send_video(TARGET_CHANNEL, video=upload_file, caption=caption, caption_entities=caption_entities, supports_streaming=True)
+                elif mime.startswith("audio/"):
+                    sent = await bot.send_audio(TARGET_CHANNEL, audio=upload_file, caption=caption, caption_entities=caption_entities)
+                else:
+                    sent = await bot.send_document(TARGET_CHANNEL, document=upload_file, caption=caption, caption_entities=caption_entities)
+                sent_messages.append(sent)
+            else:
+                log.error("Could not download media for source message %s", message.id)
+                return
+        else:
+            # Text-only posts get the same tag and quote formatting as media captions.
+            await publish_text(translated) if translated else await publish_text("")
+
+        for sent in sent_messages:
+            await react_heart(sent.message_id)
+        if remainder:
+            for chunk in split_text(remainder):
+                sent = await bot.send_message(TARGET_CHANNEL, chunk, parse_mode=None)
+                await react_heart(sent.message_id)
+        seen_ids.add(post_key)
+        save_seen()
+        log.info("Relayed message %s", message.id)
     except Exception:
-        log.exception("Failed processing album: channel=%s", getattr(event, "chat_id", "unknown"))
+        log.exception("Failed to relay message %s", message.id)
+    finally:
+        if media_path:
+            try:
+                Path(media_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
-
-PANEL_TEXT = (
-    "پنل مدیریت ربات ترجمه عربی به فارسی\n\n"
-    "از دکمه‌ها یا دستورها استفاده کن.\n"
-    "/tag — نمایش تگ فعلی\n"
-    "/settag متن_تگ — تغییر تگ\n"
-    "/status — وضعیت کانال‌ها"
-)
-
-
-@panel_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
-async def panel_start(event):
-    if not is_admin(event):
-        await event.reply("این پنل فقط برای مدیر ربات فعال است.")
+async def send_translated_album(messages, source_key: str):
+    """Send a Telegram media group with translated caption, quoted tag and heart reaction."""
+    if not messages:
         return
-    await event.reply(
-        PANEL_TEXT,
-        buttons=[
-            [Button.inline("🏷 تنظیم تگ", b"settag"), Button.inline("📌 تگ فعلی", b"showtag")],
-            [Button.inline("📡 وضعیت", b"status")],
-        ],
-    )
-
-
-@panel_client.on(events.CallbackQuery)
-async def panel_callbacks(event):
-    if event.sender_id != ADMIN_ID:
-        await event.answer("دسترسی ندارید", alert=True)
+    messages = sorted(messages, key=lambda item: item.id)
+    album_key = f"{source_key}:album:{messages[0].grouped_id or messages[0].id}"
+    if album_key in seen_ids:
         return
-    data = event.data or b""
-    if data == b"settag":
-        await event.answer()
-        await event.respond("برای تنظیم تگ این دستور را بفرست:\n/settag @YourTag")
-    elif data == b"showtag":
-        await event.answer()
-        await event.respond("تگ فعلی:\n" + (get_tag() or "(خالی)"))
-    elif data == b"status":
-        await event.answer()
-        await event.respond(
-            f"منابع: {', '.join(SOURCE_CHANNELS)}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}"
-        )
 
+    original = ""
+    for item in messages:
+        if item.message:
+            original = clean_text(item.message)
+            if original:
+                break
+    translated = ""
+    if original:
+        try:
+            translated = await translate_text(original)
+        except Exception:
+            log.exception("Album translation failed for %s", album_key)
+            if TRANSLATE_REQUIRED:
+                return
 
-@panel_client.on(events.NewMessage(pattern=r"^/tag(?:@\w+)?$"))
-async def panel_tag(event):
-    if not is_admin(event):
-        return
-    await event.reply("تگ فعلی:\n" + (get_tag() or "(خالی)"))
-
-
-@panel_client.on(events.NewMessage(pattern=r"^/settag(?:@\w+)?(?:\s+([\s\S]+))?$"))
-async def panel_settag(event):
-    if not is_admin(event):
-        await event.reply("دسترسی ندارید.")
-        return
-    value = (event.pattern_match.group(1) or "").strip()
-    if not value:
-        await event.reply("تگ را بعد از دستور بنویس؛ نمونه:\n/settag @rasedpersian")
-        return
-    if len(value) > 100:
-        await event.reply("تگ خیلی طولانی است؛ حداکثر ۱۰۰ نویسه.")
-        return
-    # Telegram custom emoji are entities, not part of the plain text string.
-    # Store their document IDs and offsets relative to the tag itself.
-    match_start = event.pattern_match.start(1)
-    prefix_units = len((event.raw_text or "")[:match_start].encode("utf-16-le")) // 2
-    value_start = prefix_units
-    value_end = value_start + len(value.encode("utf-16-le")) // 2
-    saved_entities = []
-    for entity in (getattr(event.message, "entities", None) or []):
-        if isinstance(entity, MessageEntityCustomEmoji):
-            if entity.offset >= value_start and entity.offset + entity.length <= value_end:
-                saved_entities.append({
-                    "offset": int(entity.offset - value_start),
-                    "length": int(entity.length),
-                    "document_id": int(entity.document_id),
-                })
-    with settings_lock:
-        settings["tag"] = value
-        settings["tag_entities"] = saved_entities
+    media_items, paths = [], []
     try:
-        save_settings()
-    except OSError:
-        log.exception("Could not save settings file")
-        await event.reply("تگ برای این اجرا تغییر کرد، اما ذخیره‌سازی فایل ناموفق بود.")
-        return
-    await event.reply("تگ ذخیره شد و از پست بعدی استفاده می‌شود:\n" + value)
+        full_caption = add_tag(translated)
+        caption = full_caption[:1024] if full_caption else None
+        entities = quote_entities(caption or "")
+        for index, item in enumerate(messages):
+            if not item.media:
+                continue
+            mime = (getattr(item.file, "mime_type", "") or "").lower() if item.file else ""
+            suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "video/mp4": ".mp4"}.get(mime, ".bin")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                path = tmp.name
+            paths.append(path)
+            downloaded = await item.download_media(file=path)
+            if not downloaded:
+                log.error("Could not download album media item %s", item.id)
+                return
+            upload = FSInputFile(downloaded)
+            item_caption = caption if not media_items else None
+            item_entities = entities if not media_items else None
+            if mime.startswith("video/"):
+                media_items.append(InputMediaVideo(media=upload, caption=item_caption, caption_entities=item_entities, supports_streaming=True))
+            elif mime.startswith("image/"):
+                media_items.append(InputMediaPhoto(media=upload, caption=item_caption, caption_entities=item_entities))
+            else:
+                media_items.append(InputMediaDocument(media=upload, caption=item_caption, caption_entities=item_entities))
 
+        sent_messages = []
+        if len(media_items) >= 2:
+            sent_messages = await bot.send_media_group(TARGET_CHANNEL, media=media_items)
+        elif len(media_items) == 1:
+            only = media_items[0]
+            if isinstance(only, InputMediaVideo):
+                sent_messages = [await bot.send_video(TARGET_CHANNEL, video=only.media, caption=only.caption, caption_entities=only.caption_entities, supports_streaming=True)]
+            elif isinstance(only, InputMediaPhoto):
+                sent_messages = [await bot.send_photo(TARGET_CHANNEL, photo=only.media, caption=only.caption, caption_entities=only.caption_entities)]
+            else:
+                sent_messages = [await bot.send_document(TARGET_CHANNEL, document=only.media, caption=only.caption, caption_entities=only.caption_entities)]
+        else:
+            sent_messages = []
+            await publish_text(translated)
 
-@panel_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
-async def panel_status(event):
-    if not is_admin(event):
-        return
-    await event.reply(
-        f"وضعیت: فعال\nمنابع: {', '.join(SOURCE_CHANNELS)}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}\nترجمه: API ترجمه تلگرام به فارسی"
-    )
+        # React to the first item of the album (Telegram treats the album as one post).
+        if sent_messages:
+            await react_heart(sent_messages[0].message_id)
+        remainder = full_caption[1024:].strip() if len(full_caption) > 1024 else ""
+        if remainder:
+            for chunk in split_text(remainder):
+                sent = await bot.send_message(TARGET_CHANNEL, chunk, parse_mode=None)
+                await react_heart(sent.message_id)
 
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"Arabic-to-Persian Telegram repost bot is running.\n"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server():
-    port = int(os.getenv("PORT", "8080"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Health page listening on port %s", port)
+        seen_ids.add(album_key)
+        for item in messages:
+            seen_ids.add(f"{source_key}:{item.id}")
+        save_seen()
+        log.info("Relayed album %s (%s items)", album_key, len(media_items))
+    except Exception:
+        log.exception("Failed to relay album %s", album_key)
+    finally:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 async def main():
-    start_health_server()
-    await user_client.start()
-    log.info("User account connected; sources=%s target=%s", ",".join(SOURCE_CHANNELS), TARGET_CHANNEL)
-    await panel_client.start(bot_token=BOT_TOKEN)
-    log.info("Admin panel bot connected")
+    load_seen()
+    await client.start()
+    me = await client.get_me()
+    log.info("Telethon connected as %s", getattr(me, "username", None) or me.id)
+    sources = []
+    for source_name in SOURCE_CHANNELS:
+        try:
+            entity = await client.get_entity(source_name)
+            sources.append((source_name, entity))
+            log.info("Watching @%s -> %s", source_name, TARGET_CHANNEL)
+        except Exception:
+            log.exception("Could not access source channel @%s", source_name)
 
-    # Resolve all source channels early so configuration/access problems are visible.
-    if not SOURCE_CHANNELS:
-        raise RuntimeError("No source channels configured. Set SOURCE_CHANNELS or SOURCE_CHANNEL.")
-    for source in SOURCE_CHANNELS:
-        await user_client.get_entity(source)
-        log.info("Source channel ready: %s", source)
-    await user_client.get_entity(TARGET_CHANNEL)
-    user_client.add_event_handler(on_new_message, events.NewMessage(chats=SOURCE_CHANNELS))
-    user_client.add_event_handler(on_album, events.Album(chats=SOURCE_CHANNELS))
-    log.info("STARTUP_MARKER=ARABIC_TO_PERSIAN_TELEGRAM_TRANSLATOR_V2_TWO_SOURCES")
-    await asyncio.gather(user_client.run_until_disconnected(), panel_client.run_until_disconnected())
+    if not sources:
+        raise RuntimeError("No source channels could be opened. Check SOURCE_CHANNELS and account membership.")
 
+    source_entities = [entity for _, entity in sources]
+    log.info("Active source channels (%s): %s", len(sources), ", ".join("@" + name for name, _ in sources))
+
+    @client.on(events.Album(chats=source_entities))
+    async def on_album(event):
+        await send_translated_album(event.messages, str(event.chat_id))
+
+    @client.on(events.NewMessage(chats=source_entities))
+    async def on_new_message(event):
+        # Telegram sends each album item as a NewMessage too; the Album handler
+        # publishes the group together, so skip individual album items here.
+        if getattr(event.message, "grouped_id", None):
+            return
+        await send_translated_message(event.message, str(event.chat_id))
+
+    if CATCHUP_LIMIT:
+        for source_name, source in sources:
+            source_key = str(getattr(source, "id", source_name))
+            for message in reversed(await client.get_messages(source, limit=CATCHUP_LIMIT)):
+                post_key = f"{source_key}:{message.id}"
+                if post_key not in seen_ids and str(message.id) not in seen_ids:
+                    await send_translated_message(message, source_key)
+    await client.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
