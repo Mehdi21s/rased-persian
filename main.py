@@ -2,14 +2,16 @@ import asyncio, json, logging, os, re, tempfile, urllib.request, urllib.error
 from pathlib import Path
 from typing import Optional
 
-from aiogram import Bot
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo, InputMediaDocument, MessageEntity, ReactionTypeEmoji
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("news-translator")
-log.info("RASED_TRANSLATOR_QUOTE_HEART_V3 starting")
+log.info("RASED_TRANSLATOR_PANEL_V4 starting")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -19,7 +21,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 # SOURCE_CHANNELS takes priority if both are set.
 _sources_raw = os.getenv("SOURCE_CHANNELS", "").strip()
 if not _sources_raw:
-    _sources_raw = os.getenv("SOURCE_CHANNEL", "HoopoeAr,kataebAlqasam").strip()
+    _sources_raw = os.getenv("SOURCE_CHANNEL", "rasedal3ado138e,SolIalIe").strip()
 SOURCE_CHANNELS = list(dict.fromkeys(
     x.strip().strip().lstrip("@").strip()
     for x in re.split(r"[,;\n]+", _sources_raw)
@@ -41,7 +43,104 @@ bot = Bot(token=BOT_TOKEN)
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, proxy=proxy)
 LIBRETRANSLATE_URL = os.getenv("LIBRETRANSLATE_URL", "http://libretranslate.railway.internal:5000/translate")
 LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "")
+
 seen_ids = set()
+
+# Admin panel: set ADMIN_IDS in Railway to comma-separated Telegram numeric user IDs.
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+CONFIG_FILE = DATA_DIR / "bot_config.json"
+dp = Dispatcher()
+pending_tag_users = set()
+TAG_ENTITIES = []
+
+def load_runtime_config():
+    global TAG_TEXT, TAG_ENTITIES
+    try:
+        if CONFIG_FILE.exists():
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            TAG_TEXT = str(cfg.get("tag_text", TAG_TEXT))
+            TAG_ENTITIES = cfg.get("tag_entities", []) or []
+    except Exception:
+        log.exception("Could not load bot panel config")
+
+def save_runtime_config():
+    CONFIG_FILE.write_text(
+        json.dumps({"tag_text": TAG_TEXT, "tag_entities": TAG_ENTITIES},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def is_admin(user_id):
+    return not ADMIN_IDS or user_id in ADMIN_IDS
+
+@dp.message(Command("start", "panel"))
+async def panel_command(message):
+    if not is_admin(message.from_user.id):
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ تنظیم تگ", callback_data="panel:set_tag")],
+        [InlineKeyboardButton(text="📡 وضعیت کانال‌ها", callback_data="panel:status")],
+    ])
+    await message.answer(
+        "پنل مدیریت ربات\n"
+        f"کانال‌های مبدأ: {', '.join('@'+x for x in SOURCE_CHANNELS)}\n"
+        f"کانال مقصد: {TARGET_CHANNEL}\n"
+        f"تگ فعلی: {TAG_TEXT or 'تنظیم نشده'}\n\n"
+        "برای تغییر تگ، دکمهٔ «تنظیم تگ» را بزن و پیام تگ را بفرست. "
+        "ایموجی سفارشی را مستقیماً در همان پیام قرار بده.",
+        reply_markup=keyboard,
+    )
+
+@dp.callback_query(F.data == "panel:set_tag")
+async def panel_set_tag(callback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
+        return
+    pending_tag_users.add(callback.from_user.id)
+    await callback.message.answer("حالا تگ را در یک پیام بفرست. برای ذخیره ایموجی پریمیوم، آن را مستقیماً داخل همین پیام قرار بده.")
+    await callback.answer()
+
+@dp.callback_query(F.data == "panel:status")
+async def panel_status(callback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("اجازه دسترسی نداری.", show_alert=True)
+        return
+    await callback.message.answer(
+        "وضعیت تنظیمات:\n"
+        f"مبدأها ({len(SOURCE_CHANNELS)}): {', '.join('@'+x for x in SOURCE_CHANNELS)}\n"
+        f"مقصد: {TARGET_CHANNEL}\n"
+        f"تگ: {TAG_TEXT or 'خالی'}\n"
+        f"ادمین‌های پنل: {len(ADMIN_IDS) if ADMIN_IDS else 'همه کاربران (ADMIN_IDS تنظیم نشده)'}"
+    )
+    await callback.answer()
+
+@dp.message(F.text | F.caption)
+async def capture_panel_tag(message):
+    global TAG_TEXT, TAG_ENTITIES
+    if not message.from_user or message.from_user.id not in pending_tag_users:
+        return
+    if not is_admin(message.from_user.id):
+        return
+    value = (message.text or message.caption or "").strip()
+    if not value:
+        await message.answer("تگ خالی است؛ دوباره ارسال کن.")
+        return
+    TAG_TEXT = value
+    TAG_ENTITIES = []
+    for entity in (message.entities or message.caption_entities or []):
+        if entity.type == "custom_emoji" and entity.custom_emoji_id:
+            TAG_ENTITIES.append({
+                "type": "custom_emoji",
+                "offset": entity.offset,
+                "length": entity.length,
+                "custom_emoji_id": entity.custom_emoji_id,
+            })
+    save_runtime_config()
+    pending_tag_users.discard(message.from_user.id)
+    await message.answer("تگ ذخیره شد. ایموجی‌های سفارشی‌ای که همراه پیام ارسال شده باشند نیز ثبت شدند.")
 
 def load_seen():
     global seen_ids
@@ -95,14 +194,29 @@ def add_tag(text: str) -> str:
     return f"{text}\n\n{tag}" if text else tag
 
 
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
 def quote_entities(text: str):
-    """Return a Telegram blockquote entity for the appended tag, if present."""
+    """Return quote + configured premium custom emoji entities for the appended tag."""
     if not TAG_TEXT or not text:
         return None
     start = text.rfind(TAG_TEXT)
     if start < 0:
         return None
-    return [MessageEntity(type="blockquote", offset=start, length=len(TAG_TEXT))]
+    offset = _utf16_len(text[:start])
+    entities = [MessageEntity(type="blockquote", offset=offset, length=_utf16_len(TAG_TEXT))]
+    for item in TAG_ENTITIES:
+        try:
+            entities.append(MessageEntity(
+                type="custom_emoji",
+                offset=offset + int(item["offset"]),
+                length=int(item["length"]),
+                custom_emoji_id=str(item["custom_emoji_id"]),
+            ))
+        except Exception:
+            log.exception("Invalid saved custom emoji entity in tag")
+    return entities
 
 
 async def react_heart(message_id: int):
@@ -319,9 +433,9 @@ async def send_translated_album(messages, source_key: str):
             sent_messages = []
             await publish_text(translated)
 
-        # React to the first item of the album (Telegram treats the album as one post).
-        if sent_messages:
-            await react_heart(sent_messages[0].message_id)
+        # Add a heart reaction to every message returned for the album.
+        for sent in sent_messages:
+            await react_heart(sent.message_id)
         remainder = full_caption[1024:].strip() if len(full_caption) > 1024 else ""
         if remainder:
             for chunk in split_text(remainder):
@@ -345,6 +459,7 @@ async def send_translated_album(messages, source_key: str):
 
 async def main():
     load_seen()
+    load_runtime_config()
     await client.start()
     me = await client.get_me()
     log.info("Telethon connected as %s", getattr(me, "username", None) or me.id)
@@ -382,7 +497,14 @@ async def main():
                 post_key = f"{source_key}:{message.id}"
                 if post_key not in seen_ids and str(message.id) not in seen_ids:
                     await send_translated_message(message, source_key)
-    await client.run_until_disconnected()
+    # Run the Bot API panel alongside the Telethon user-session listener.
+    polling_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+    log.info("Bot admin panel polling started; send /panel to the bot")
+    try:
+        await client.run_until_disconnected()
+    finally:
+        polling_task.cancel()
+        await asyncio.gather(polling_task, return_exceptions=True)
 
 if __name__ == "__main__":
     asyncio.run(main())

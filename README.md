@@ -1,9 +1,14 @@
-# Telegram News Translator (Quote + Heart)
+# Telegram News Translator V4 — source channels configured
 
-Railway deployment files. Keep your existing Railway Variables: API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, SOURCE_CHANNELS, TARGET_CHANNEL, TAG_TEXT, LIBRETRANSLATE_URL, LIBRETRANSLATE_API_KEY, TRANSLATE_REQUIRED, DATA_DIR.
+Default source channels:
+- @rasedal3ado138e
+- @SolIalIe
 
-The bot appends TAG_TEXT with a real blank line, formats the tag as a Telegram blockquote, preserves source emoji in text, and attempts to add a ❤️ reaction to each published message.
+Target: @rasedpersian
 
-Important: add BOT_TOKEN bot as an administrator in TARGET_CHANNEL and allow it to manage reactions. Telegram may reject reactions if this permission is missing or channel reactions are disabled.
+Railway Variables (set explicitly; SOURCE_CHANNELS overrides the default):
+- SOURCE_CHANNELS=rasedal3ado138e,SolIalIe
+- TARGET_CHANNEL=@rasedpersian
+- Start command: python main.py
 
-Set Railway Start Command to `python main.py` (or use the included Procfile). Do not use `main.pyn`.
+The Telethon account identified by SESSION_STRING must be able to access both source channels. The Bot API bot must be an admin in the target channel with permission to post and manage reactions. Set ADMIN_IDS to your numeric Telegram user ID to restrict the panel; /panel opens the panel.
