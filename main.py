@@ -21,7 +21,22 @@ API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@rasedal3ado138e")
+# Configure one or more sources. Preferred: SOURCE_CHANNELS="@source1,@source2".
+# Backward compatible: SOURCE_CHANNEL plus optional SOURCE_CHANNEL_2.
+def _read_source_channels():
+    combined = os.getenv("SOURCE_CHANNELS", "").strip()
+    if combined:
+        values = [item.strip() for item in combined.split(",") if item.strip()]
+    else:
+        values = [
+            os.getenv("SOURCE_CHANNEL", "@rasedal3ado138e").strip(),
+            os.getenv("SOURCE_CHANNEL_2", "@SolIalIe").strip(),
+        ]
+        values = [item for item in values if item]
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(values))
+
+SOURCE_CHANNELS = _read_source_channels()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@rasedpersian")
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "settings.json"))
 
@@ -136,20 +151,26 @@ async def on_new_message(event):
     if getattr(event.message, "grouped_id", None):
         return
     try:
-        source_peer = await user_client.get_input_entity(SOURCE_CHANNEL)
+        source_peer = await user_client.get_input_entity(event.chat_id)
         target_peer = await user_client.get_input_entity(TARGET_CHANNEL)
+        log.info("Received source message: channel=%s message_id=%s", event.chat_id, event.message.id)
         await translate_and_publish([event.message], source_peer, target_peer)
     except Exception:
-        log.exception("Failed processing source message %s", event.message.id)
+        log.exception(
+            "Failed processing source message: channel=%s message_id=%s",
+            getattr(event, "chat_id", "unknown"), event.message.id
+        )
 
 
 async def on_album(event):
     try:
-        source_peer = await user_client.get_input_entity(SOURCE_CHANNEL)
+        source_peer = await user_client.get_input_entity(event.chat_id)
         target_peer = await user_client.get_input_entity(TARGET_CHANNEL)
+        message_ids = ",".join(str(m.id) for m in event.messages)
+        log.info("Received source album: channel=%s message_ids=%s", event.chat_id, message_ids)
         await translate_and_publish(list(event.messages), source_peer, target_peer)
     except Exception:
-        log.exception("Failed processing album")
+        log.exception("Failed processing album: channel=%s", getattr(event, "chat_id", "unknown"))
 
 
 PANEL_TEXT = (
@@ -190,7 +211,7 @@ async def panel_callbacks(event):
     elif data == b"status":
         await event.answer()
         await event.respond(
-            f"منبع: {SOURCE_CHANNEL}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}"
+            f"منابع: {', '.join(SOURCE_CHANNELS)}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}"
         )
 
 
@@ -229,7 +250,7 @@ async def panel_status(event):
     if not is_admin(event):
         return
     await event.reply(
-        f"وضعیت: فعال\nمنبع: {SOURCE_CHANNEL}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}\nترجمه: API رسمی ترجمه تلگرام به فارسی"
+        f"وضعیت: فعال\nمنابع: {', '.join(SOURCE_CHANNELS)}\nمقصد: {TARGET_CHANNEL}\nتگ: {get_tag() or '(خالی)'}\nترجمه: API ترجمه تلگرام به فارسی"
     )
 
 
@@ -256,16 +277,20 @@ def start_health_server():
 async def main():
     start_health_server()
     await user_client.start()
-    log.info("User account connected; source=%s target=%s", SOURCE_CHANNEL, TARGET_CHANNEL)
+    log.info("User account connected; sources=%s target=%s", ",".join(SOURCE_CHANNELS), TARGET_CHANNEL)
     await panel_client.start(bot_token=BOT_TOKEN)
     log.info("Admin panel bot connected")
 
-    # Resolve channel access early so configuration problems appear in the logs.
-    await user_client.get_entity(SOURCE_CHANNEL)
+    # Resolve all source channels early so configuration/access problems are visible.
+    if not SOURCE_CHANNELS:
+        raise RuntimeError("No source channels configured. Set SOURCE_CHANNELS or SOURCE_CHANNEL.")
+    for source in SOURCE_CHANNELS:
+        await user_client.get_entity(source)
+        log.info("Source channel ready: %s", source)
     await user_client.get_entity(TARGET_CHANNEL)
-    user_client.add_event_handler(on_new_message, events.NewMessage(chats=SOURCE_CHANNEL))
-    user_client.add_event_handler(on_album, events.Album(chats=SOURCE_CHANNEL))
-    log.info("STARTUP_MARKER=ARABIC_TO_PERSIAN_TELEGRAM_TRANSLATOR_V1")
+    user_client.add_event_handler(on_new_message, events.NewMessage(chats=SOURCE_CHANNELS))
+    user_client.add_event_handler(on_album, events.Album(chats=SOURCE_CHANNELS))
+    log.info("STARTUP_MARKER=ARABIC_TO_PERSIAN_TELEGRAM_TRANSLATOR_V2_TWO_SOURCES")
     await asyncio.gather(user_client.run_until_disconnected(), panel_client.run_until_disconnected())
 
 
