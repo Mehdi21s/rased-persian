@@ -202,6 +202,76 @@ def add_tag(text: str) -> str:
 def _utf16_len(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
+
+def _slice_utf16(value: str, start: int, length: int) -> str:
+    """Slice a Python string using Telegram's UTF-16 entity offsets."""
+    raw = value.encode("utf-16-le")
+    return raw[start * 2:(start + length) * 2].decode("utf-16-le", errors="ignore")
+
+
+def protect_custom_emojis(text: str, entities):
+    """
+    Replace source custom-emoji spans with translation-resistant tokens.
+    Return text plus token metadata; offsets are interpreted as UTF-16 units.
+    """
+    found = []
+    for entity in (entities or []):
+        if isinstance(entity, tl_types.MessageEntityCustomEmoji):
+            glyph = _slice_utf16(text, entity.offset, entity.length)
+            if glyph:
+                found.append((entity.offset, entity.length, int(entity.document_id), glyph))
+
+    # Replace from right to left so original UTF-16 offsets remain valid.
+    protected = text
+    tokens = []
+    for index, (offset, length, document_id, glyph) in enumerate(sorted(found, reverse=True)):
+        token = f"ZXQCE{index}QXZ"
+        start_py = len(_slice_utf16(text, 0, offset))
+        end_py = len(_slice_utf16(text, 0, offset + length))
+        protected = protected[:start_py] + token + protected[end_py:]
+        tokens.append((token, document_id, glyph))
+    return protected, list(reversed(tokens))
+
+
+def restore_custom_emojis(translated: str, tokens):
+    """Restore original glyphs and build correctly offset Telethon entities."""
+    restored = translated
+    entities = []
+    for token, document_id, glyph in tokens:
+        if token not in restored:
+            log.warning("Translator dropped or changed protected custom-emoji token %s", token)
+            continue
+        position = restored.index(token)
+        before = restored[:position]
+        restored = before + glyph + restored[position + len(token):]
+        entities.append(tl_types.MessageEntityCustomEmoji(
+            offset=_utf16_len(before), length=_utf16_len(glyph), document_id=document_id
+        ))
+    return restored, entities
+
+
+async def translate_message_content(message):
+    """Translate message text while retaining source Premium custom emojis."""
+    raw = message.message or ""
+    protected, tokens = protect_custom_emojis(raw, getattr(message, "entities", None))
+    cleaned = clean_text(protected)
+    if not cleaned:
+        return "", []
+    try:
+        translated = await translate_text(cleaned)
+    except Exception:
+        raise
+    translated, emoji_entities = restore_custom_emojis(translated, tokens)
+    return translated, emoji_entities
+
+
+def combine_entities(*groups):
+    result = []
+    for group in groups:
+        if group:
+            result.extend(group)
+    return result or None
+
 def quote_entities(text: str):
     """Create Telegram entities for the Premium user session (not Bot API)."""
     if not TAG_TEXT or not text:
@@ -231,13 +301,15 @@ async def react_heart(message_id: int):
         log.exception("Could not add heart reaction to target message %s; check bot admin/reaction permissions", message_id)
 
 
-async def publish_text(text: str):
+async def publish_text(text: str, source_entities=None):
     """Publish text using the connected Premium Telegram account."""
     full_text = add_tag(text)
     sent_messages = []
     for chunk in split_text(full_text):
+        # Custom emoji offsets are retained when the post fits in one Telegram message.
+        entities = combine_entities(source_entities, quote_entities(chunk)) if chunk == full_text else quote_entities(chunk)
         sent = await client.send_message(
-            TARGET_CHANNEL, chunk, formatting_entities=quote_entities(chunk), link_preview=False
+            TARGET_CHANNEL, chunk, formatting_entities=entities, link_preview=False
         )
         await react_heart(sent.id)
         sent_messages.append(sent)
@@ -303,20 +375,24 @@ async def send_translated_message(message, source_key: str):
     post_key = f"{source_key}:{message.id}"
     if post_key in seen_ids or str(message.id) in seen_ids:
         return
-    original = clean_text(message.message or "")
     translated = ""
-    if original:
+    source_emoji_entities = []
+    if message.message:
         try:
-            translated = await translate_text(original)
+            translated, source_emoji_entities = await translate_message_content(message)
         except Exception:
             log.exception("Translation failed for message %s", message.id)
             if TRANSLATE_REQUIRED:
                 return
-            translated = original
+            translated = clean_text(message.message or "")
+            source_emoji_entities = []
 
     full_caption = add_tag(translated)
     caption = full_caption[:1024] if full_caption else None
-    caption_entities = quote_entities(caption or "")
+    caption_entities = combine_entities(
+        [e for e in source_emoji_entities if e.offset + e.length <= _utf16_len(caption or "")],
+        quote_entities(caption or "")
+    )
     remainder = full_caption[1024:].strip() if len(full_caption) > 1024 else ""
     media_path = None
     try:
@@ -331,7 +407,7 @@ async def send_translated_message(message, source_key: str):
             if downloaded:
                 sent = await client.send_file(
                     TARGET_CHANNEL, downloaded, caption=caption or "",
-                    formatting_entities=quote_entities(caption or ""),
+                    formatting_entities=caption_entities,
                     supports_streaming=mime.startswith("video/"),
                 )
                 sent_messages.extend(sent if isinstance(sent, list) else [sent])
@@ -340,7 +416,7 @@ async def send_translated_message(message, source_key: str):
                 return
         else:
             # Text-only posts get the same tag and quote formatting as media captions.
-            await publish_text(translated) if translated else await publish_text("")
+            await publish_text(translated, source_emoji_entities) if translated else await publish_text("")
 
         for sent in sent_messages:
             await react_heart(sent.id)
@@ -369,26 +445,28 @@ async def send_translated_album(messages, source_key: str):
     if album_key in seen_ids:
         return
 
-    original = ""
+    translated = ""
+    source_emoji_entities = []
     for item in messages:
         if item.message:
-            original = clean_text(item.message)
-            if original:
+            try:
+                translated, source_emoji_entities = await translate_message_content(item)
+            except Exception:
+                log.exception("Album translation failed for %s", album_key)
+                if TRANSLATE_REQUIRED:
+                    return
+                translated = clean_text(item.message or "")
+            if translated:
                 break
-    translated = ""
-    if original:
-        try:
-            translated = await translate_text(original)
-        except Exception:
-            log.exception("Album translation failed for %s", album_key)
-            if TRANSLATE_REQUIRED:
-                return
 
     media_items, paths = [], []
     try:
         full_caption = add_tag(translated)
         caption = full_caption[:1024] if full_caption else None
-        entities = quote_entities(caption or "")
+        entities = combine_entities(
+            [e for e in source_emoji_entities if e.offset + e.length <= _utf16_len(caption or "")],
+            quote_entities(caption or "")
+        )
         for index, item in enumerate(messages):
             if not item.media:
                 continue
@@ -419,7 +497,7 @@ async def send_translated_album(messages, source_key: str):
             )
             sent_messages = sent if isinstance(sent, list) else [sent]
         else:
-            await publish_text(translated)
+            await publish_text(translated, source_emoji_entities)
 
         # Heart reaction is added to every message in the album.
         for sent in sent_messages:
