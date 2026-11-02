@@ -9,6 +9,7 @@ from pathlib import Path
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl import functions
+from telethon.tl.types import MessageEntityCustomEmoji
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -45,10 +46,13 @@ def load_settings():
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            return {"tag": str(data.get("tag", "@rasedpersian"))}
+            return {
+                "tag": str(data.get("tag", "@rasedpersian")),
+                "tag_entities": data.get("tag_entities", []),
+            }
     except (OSError, json.JSONDecodeError):
         pass
-    return {"tag": os.getenv("POST_TAG", "@rasedpersian")}
+    return {"tag": os.getenv("POST_TAG", "@rasedpersian"), "tag_entities": []}
 
 
 settings = load_settings()
@@ -65,6 +69,82 @@ def save_settings():
 def get_tag():
     with settings_lock:
         return settings.get("tag", "").strip()
+
+
+def get_tag_entities(prefix=""):
+    """Return saved custom-emoji entities shifted after the supplied prefix."""
+    shift = len((prefix or "").encode("utf-16-le")) // 2
+    with settings_lock:
+        saved = list(settings.get("tag_entities", []))
+    result = []
+    for item in saved:
+        try:
+            result.append(MessageEntityCustomEmoji(
+                offset=int(item["offset"]) + shift,
+                length=int(item["length"]),
+                document_id=int(item["document_id"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            log.warning("Ignoring invalid saved custom emoji entity")
+    return result
+
+
+def utf16_to_index(text, offset):
+    """Convert Telegram's UTF-16 offset to a Python string index."""
+    units = 0
+    for i, char in enumerate(text):
+        if units >= offset:
+            return i
+        units += len(char.encode("utf-16-le")) // 2
+    return len(text)
+
+
+def custom_emoji_entities_from_message(message, target_text):
+    """Keep source custom emojis only when their placeholder character survives translation."""
+    original = message.message or ""
+    target_entities = []
+    for entity in (getattr(message, "entities", None) or []):
+        if not isinstance(entity, MessageEntityCustomEmoji):
+            continue
+        start = utf16_to_index(original, entity.offset)
+        end = utf16_to_index(original, entity.offset + entity.length)
+        placeholder = original[start:end]
+        if not placeholder:
+            continue
+        pos = target_text.find(placeholder)
+        if pos < 0:
+            continue
+        target_offset = len(target_text[:pos].encode("utf-16-le")) // 2
+        target_entities.append(MessageEntityCustomEmoji(
+            offset=target_offset,
+            length=entity.length,
+            document_id=entity.document_id,
+        ))
+    return target_entities
+
+
+def with_tag(text, tag):
+    text = (text or "").strip()
+    tag = (tag or "").strip()
+    if not tag:
+        return text
+    return f"{text}\\n\\n{tag}" if text else tag
+
+
+async def send_tagged_text(target_peer, text, source_message=None):
+    """Send text with custom emoji entities for source text (when mappable) and saved tag."""
+    text = (text or "").strip()
+    tag = get_tag()
+    body = f"{text}\\n\\n{tag}" if text and tag else (text or tag)
+    entities = []
+    if source_message and text:
+        entities.extend(custom_emoji_entities_from_message(source_message, text))
+    if tag:
+        prefix = f"{text}\\n\\n" if text else ""
+        entities.extend(get_tag_entities(prefix))
+    await user_client.send_message(
+        target_peer, body, formatting_entities=entities or None, link_preview=False
+    )
 
 
 def is_admin(event):
@@ -114,7 +194,7 @@ async def translate_and_publish(messages, source_peer, target_peer):
             if not translated:
                 log.warning("Empty translation for source message %s; skipped", message.id)
                 continue
-            await user_client.send_message(target_peer, with_tag(translated, get_tag()), link_preview=False)
+            await send_tagged_text(target_peer, translated, source_message=message)
             log.info("Published text message %s", message.id)
         return
 
@@ -131,19 +211,25 @@ async def translate_and_publish(messages, source_peer, target_peer):
     # captions to a separate text post instead of failing the entire album send.
     if translated_caption and len(with_tag(translated_caption, tag)) <= 900:
         caption = with_tag(translated_caption, tag)
+        caption_entities = []
+        if captions:
+            caption_entities.extend(custom_emoji_entities_from_message(captions[0][0], translated_caption))
+        if tag:
+            prefix = f"{translated_caption}\\n\\n" if translated_caption else ""
+            caption_entities.extend(get_tag_entities(prefix))
         await user_client.send_file(
             target_peer,
             [m for m in media_messages],
             caption=caption,
+            formatting_entities=caption_entities or None,
         )
     else:
         await user_client.send_file(target_peer, [m for m in media_messages])
         if translated_caption:
-            await user_client.send_message(
-                target_peer, with_tag(translated_caption, tag), link_preview=False
-            )
+            caption_source = captions[0][0] if captions else None
+            await send_tagged_text(target_peer, translated_caption, source_message=caption_source)
         elif tag:
-            await user_client.send_message(target_peer, tag, link_preview=False)
+            await send_tagged_text(target_peer, "")
     log.info("Published media group/message %s", ",".join(str(m.id) for m in messages))
 
 
@@ -234,8 +320,24 @@ async def panel_settag(event):
     if len(value) > 100:
         await event.reply("تگ خیلی طولانی است؛ حداکثر ۱۰۰ نویسه.")
         return
+    # Telegram custom emoji are entities, not part of the plain text string.
+    # Store their document IDs and offsets relative to the tag itself.
+    match_start = event.pattern_match.start(1)
+    prefix_units = len((event.raw_text or "")[:match_start].encode("utf-16-le")) // 2
+    value_start = prefix_units
+    value_end = value_start + len(value.encode("utf-16-le")) // 2
+    saved_entities = []
+    for entity in (getattr(event.message, "entities", None) or []):
+        if isinstance(entity, MessageEntityCustomEmoji):
+            if entity.offset >= value_start and entity.offset + entity.length <= value_end:
+                saved_entities.append({
+                    "offset": int(entity.offset - value_start),
+                    "length": int(entity.length),
+                    "document_id": int(entity.document_id),
+                })
     with settings_lock:
         settings["tag"] = value
+        settings["tag_entities"] = saved_entities
     try:
         save_settings()
     except OSError:
