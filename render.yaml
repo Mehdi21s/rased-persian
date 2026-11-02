@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: arabic-to-persian-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: SOURCE_CHANNEL
+        value: '@rasedal3ado138e'
+      - key: TARGET_CHANNEL
+        value: '@rasedpersian'
+      - key: POST_TAG
+        value: '@rasedpersian'
